@@ -2,9 +2,12 @@ import json
 import time
 import argparse
 import statistics
+import platform
+import datetime
 
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
+import importlib
 
 
 def main():
@@ -14,13 +17,40 @@ def main():
     ap.add_argument("--input", default="data/dev.jsonl")
     ap.add_argument("--max_length", type=int, default=256)
     ap.add_argument("--runs", type=int, default=50)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--quantize", action="store_true", help="Apply dynamic quantization to model for CPU inference")
+    ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir if args.model_name is None else args.model_name)
-    model = AutoModelForTokenClassification.from_pretrained(args.model_dir)
+    # Try loading a standard HF token-classification model; if that fails (e.g. we saved a custom
+    # CRF model), fall back to the CRF wrapper loader.
+    try:
+        model = AutoModelForTokenClassification.from_pretrained(args.model_dir)
+        if not (hasattr(model, "classifier") or hasattr(model, "crf")):
+            raise RuntimeError("Loaded model is not a token-classification model")
+    except Exception:
+        try:
+            crf_mod = importlib.import_module("src.crf_model")
+        except Exception:
+            try:
+                crf_mod = importlib.import_module("crf_model")
+            except Exception:
+                raise
+        TokenClassificationWithCRF = getattr(crf_mod, "TokenClassificationWithCRF")
+        model = TokenClassificationWithCRF.from_pretrained(args.model_dir, num_labels=None)
     model.to(args.device)
     model.eval()
+
+    # Optionally apply dynamic quantization for faster CPU inference
+    quantized = False
+    if args.quantize and args.device == "cpu":
+        try:
+            from torch.quantization import quantize_dynamic
+            # quantize linear layers which are the heavy parts
+            model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+            quantized = True
+        except Exception as e:
+            print("Quantization failed:", e)
 
     texts = []
     with open(args.input, "r", encoding="utf-8") as f:

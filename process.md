@@ -65,6 +65,50 @@ Measured over 50 runs with `batch_size=1` (inference per utterance):
 - p50: 12.12 ms
 - p95: 12.92 ms
 
+---
+
+## Final selected configuration (cleaned and retained)
+
+- Model: `distilroberta-base + CRF` fine-tuned for 8 epochs
+- Saved to: `out_distil_crf_long/`
+- Deliverable predictions: `out/dev_pred.json` (thresholded at span_confidence=0.70 with tightened numeric heuristics)
+
+## Final Metrics (dev: `data/gen_dev.jsonl`)
+
+- Macro-F1 (span-level): 0.620
+- Per-entity highlights (at chosen threshold 0.70):
+  - `PERSON_NAME` F1 ≈ 0.673–0.680
+  - `CREDIT_CARD` F1 ≈ 0.692
+  - `PHONE` F1 ≈ 0.630–0.667 (varies slightly between tighter/looser numeric heuristics)
+
+- PII-only metrics (selected final predictions `out/dev_pred.json`):
+  - Precision = 0.610
+  - Recall = 0.636
+  - F1 = 0.623
+
+## Final Latency (CPU, batch_size=1)
+
+- Measured over 100 runs with `src/measure_latency.py` on `out_distil_crf_long`:
+  - p50 = 12.31 ms
+  - p95 = 14.14 ms (meets requirement p95 ≤ 20 ms)
+
+## Cleanup performed
+
+Removed intermediate/experiment folders to keep the repository minimal. Kept the following:
+
+- `out/` — required deliverable file `dev_pred.json`
+- `out_distil_crf_long/` — final model & tokenizer
+- `data/` — train/dev/test JSONL files
+- `src/`, `scripts/` — code and utilities
+- `README.md`, `requirements.txt`, `process.md`
+
+Removed:
+
+- `out_debertav3_large_crf/`, `out_distil_crf/`, `out_roberta_crf/`, `out_roberta_large_crf/`, `out_run1/`, `out_synth/`
+- `tune_out/`, `tune_out_distil/`, `tune_out_distil_long/`
+
+If you want any of the removed artifacts restored (e.g. a tuning report), I can regenerate or recover them before finalizing.
+
 These latency numbers are measured on the machine used for this run and are within the assignment's strong target (p95 <= 20 ms).
 
 ## Short analysis & next steps
@@ -140,6 +184,22 @@ Quick results (1 epoch on synthetic data):
 - Per-entity: CREDIT_CARD F1 ~0.70, PHONE F1 ~0.56, EMAIL F1 ~0.30 (others 0.0)
 - PII-only: P=0.50 R=0.354 F1=0.415 (needs improvement to reach target 0.75 P)
 - Latency (p95): 14.23 ms (batch_size=1)
+
+Latest CRF run (re-training with `roberta-base`, 6 epochs):
+
+- Per-entity F1s improved (see `out_roberta_crf/dev_pred.json`): macro-F1 ~0.599.
+- Selected PII precision: CREDIT_CARD P≈0.562, PHONE P≈0.596, PERSON_NAME P≈0.706.
+- PII-only combined precision ≈0.573 (still below 0.75 target).
+- Latency: `out_roberta_crf/latency_report.json` contains full timing report; measured p50≈26.9ms, p95≈46.7ms (batch_size=1 on CPU).
+
+Trade-offs and notes:
+- `roberta-base` + CRF gave better entity F1 scores compared to `distilbert` baseline but increased inference latency on CPU (p95 > 20 ms).
+- To meet p95 ≤ 20ms, consider: switching to a distilled/faster backbone (e.g., `distilbert` or `distilroberta`), exporting + quantizing the model (ONNX/TorchScript + int8), or serving on GPU.
+
+The repository now includes:
+- `out/dev_pred.json` — mandatory predictions file (copied from the last run `out_roberta_crf/dev_pred.json`).
+- `out_roberta_crf/dev_pred.json` — model-specific predictions.
+- `out_roberta_crf/latency_report.json` — latency timings and environment info.
 
 These show the pipeline is reproducible and fast; to reach PII precision ~0.75 you'll want to train longer, add data augmentation and possibly a stronger model or decoding adjustments (see next steps below).
 

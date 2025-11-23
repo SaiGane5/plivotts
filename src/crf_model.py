@@ -55,8 +55,24 @@ class TokenClassificationWithCRF(nn.Module):
             out.logits = emissions
             return out
         else:
-            # decode best paths
-            best_paths = self.crf.decode(emissions, mask=mask)
+            # decode best paths - CRF libraries differ in API names
+            best_paths = None
+            # Try common method names in order
+            try:
+                best_paths = self.crf.decode(emissions, mask=mask)
+            except Exception:
+                try:
+                    # some CRF implementations expose `viterbi_tags`
+                    vt = self.crf.viterbi_tags(emissions, mask=mask)
+                    # viterbi_tags might return a list of (tags, score)
+                    if isinstance(vt, list) and len(vt) > 0 and isinstance(vt[0], tuple):
+                        best_paths = [tags for tags, score in vt]
+                    else:
+                        best_paths = vt
+                except Exception:
+                    # final fallback: use argmax over emissions
+                    best_paths = emissions.argmax(dim=-1).cpu().tolist()
+
             out = type("obj", (), {})()
             out.predictions = best_paths
             out.logits = emissions
@@ -91,24 +107,45 @@ class TokenClassificationWithCRF(nn.Module):
         """
         # load config first
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
-        # determine num_labels
+
+        # If a saved checkpoint exists, try to infer num_labels from the checkpoint
+        bin_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+        state_dict = None
+        if os.path.exists(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu")
+            if num_labels is None:
+                # common keys to check
+                if "classifier.weight" in state_dict:
+                    num_labels = state_dict["classifier.weight"].shape[0]
+                else:
+                    # try to find any key that looks like classifier.weight
+                    for k in state_dict.keys():
+                        if k.endswith("classifier.weight"):
+                            num_labels = state_dict[k].shape[0]
+                            break
+                    # try CRF params
+                    if num_labels is None:
+                        for k in state_dict.keys():
+                            if k.endswith("crf.trans_matrix") or k.endswith("crf.transitions"):
+                                num_labels = state_dict[k].shape[0]
+                                break
+
+        # fallback to config if still unknown
         if num_labels is None:
-            # attempt to infer from config if present
             num_labels = getattr(config, "num_labels", None)
+
         if num_labels is None:
-            raise ValueError("num_labels must be provided if not present in the config")
+            raise ValueError("num_labels could not be inferred; please provide num_labels")
 
         # instantiate model (this will load the backbone weights from the path or HF hub)
         model = cls(pretrained_model_name_or_path, num_labels=num_labels)
 
-        # attempt to load saved state dict if present in directory
-        bin_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
-        if os.path.exists(bin_path):
-            state_dict = torch.load(bin_path, map_location="cpu")
+        # load state dict if we have one
+        if state_dict is not None:
             try:
                 model.load_state_dict(state_dict)
             except Exception:
-                # partial load: try strict=False
+                # partial load: allow strict=False to ignore param shape mismatches
                 model.load_state_dict(state_dict, strict=False)
 
         return model

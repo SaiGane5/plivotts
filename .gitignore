@@ -2,7 +2,7 @@
 
 src/__pycache__/
 
-out/
+out/model.safetensors
 
 out_roberta_crf/
 
@@ -10,3 +10,4 @@ out_run1/
 
 out_synth/
 
+out_distil_crf_long/
