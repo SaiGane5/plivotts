@@ -1,41 +1,47 @@
-PII Entity Recognition for Noisy STT Transcripts
+# PII NER Assignment Skeleton
 
-Setup
+This repo is a skeleton for a token-level NER model that tags PII in STT-style transcripts.
 
-1. Create a Python virtualenv and install dependencies:
+## Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Generate synthetic data (train/dev/test)
+## Train
 
 ```bash
-python data/generate_data.py --out_dir data --train 700 --dev 150 --test 150
+python src/train.py \
+  --model_name distilbert-base-uncased \
+  --train data/train.jsonl \
+  --dev data/dev.jsonl \
+  --out_dir out
 ```
 
-Baseline training
+## Predict
 
 ```bash
-python src/train.py --model_name distilbert-base-uncased --train data/train.jsonl --dev data/dev.jsonl --out_dir out --epochs 2 --batch_size 8
+python src/predict.py \
+  --model_dir out \
+  --input data/dev.jsonl \
+  --output out/dev_pred.json
 ```
 
-Predict and evaluate
+## Evaluate
 
 ```bash
-python src/predict.py --model_dir out --input data/dev.jsonl --output out/dev_pred.jsonl
-python src/eval_span_f1.py --gold data/dev.jsonl --pred out/dev_pred.jsonl
+python src/eval_span_f1.py \
+  --gold data/dev.jsonl \
+  --pred out/dev_pred.json
 ```
 
-Measure latency
+## Measure latency
 
 ```bash
-python src/measure_latency.py --model_dir out --input data/dev.jsonl --runs 50
+python src/measure_latency.py \
+  --model_dir out \
+  --input data/dev.jsonl \
+  --runs 50
 ```
 
-Notes
-- This repo uses a learned token classification model (HuggingFace Transformers).
-- The synthetic data generator produces lowercased, punctuation-free "noisy STT" style transcripts.
-- You can replace the model with a lighter-weight encoder or apply quantization to meet CPU latency targets.
+Your task in the assignment is to modify the model and training code to improve entity and PII detection quality while keeping **p95 latency below ~20 ms** per utterance (batch size 1, on a reasonably modern CPU).

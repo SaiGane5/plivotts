@@ -1,71 +1,105 @@
 import json
-from typing import List, Dict
-
-from datasets import Dataset
-from transformers import PreTrainedTokenizerFast
-
-from labels import LABELS
+from typing import List, Dict, Any
+from torch.utils.data import Dataset
 
 
-def read_jsonl(path: str) -> List[Dict]:
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            data.append(json.loads(line))
-    return data
+class PIIDataset(Dataset):
+    def __init__(self, path: str, tokenizer, label_list: List[str], max_length: int = 256, is_train: bool = True):
+        self.items = []
+        self.tokenizer = tokenizer
+        self.label_list = label_list
+        self.label2id = {l: i for i, l in enumerate(label_list)}
+        self.max_length = max_length
+        self.is_train = is_train
+
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                text = obj["text"]
+                entities = obj.get("entities", [])
+
+                char_tags = ["O"] * len(text)
+                for e in entities:
+                    s, e_idx, lab = e["start"], e["end"], e["label"]
+                    if s < 0 or e_idx > len(text) or s >= e_idx:
+                        continue
+                    char_tags[s] = f"B-{lab}"
+                    for i in range(s + 1, e_idx):
+                        char_tags[i] = f"I-{lab}"
+
+                enc = tokenizer(
+                    text,
+                    return_offsets_mapping=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    add_special_tokens=True,
+                )
+                offsets = enc["offset_mapping"]
+                input_ids = enc["input_ids"]
+                attention_mask = enc["attention_mask"]
+
+                bio_tags = []
+                # We will assign None for tokens we want the loss to ignore (special tokens)
+                for (start, end) in offsets:
+                    if start == end:
+                        # special token / padding in offsets -> ignore in loss
+                        bio_tags.append(None)
+                    else:
+                        if start < len(char_tags):
+                            bio_tags.append(char_tags[start])
+                        else:
+                            bio_tags.append("O")
+
+                if len(bio_tags) != len(input_ids):
+                    # fallback: mark all tokens as O except special tokens
+                    bio_tags = [None if (s == e) else "O" for (s, e) in offsets]
+
+                # Map tags to ids; use -100 for ignored tokens (HuggingFace convention)
+                label_ids = [
+                    -100 if t is None else self.label2id.get(t, self.label2id["O"]) for t in bio_tags
+                ]
+
+                self.items.append(
+                    {
+                        "id": obj["id"],
+                        "text": text,
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "labels": label_ids,
+                        "offset_mapping": offsets,
+                    }
+                )
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.items[idx]
 
 
-def char_labels_from_entities(text: str, entities: List[Dict]) -> List[str]:
-    labels = ["O"] * len(text)
-    for ent in entities:
-        s = ent["start"]
-        e = ent["end"]
-        lab = ent["label"]
-        if s < 0 or e > len(text):
-            continue
-        if s < e:
-            labels[s] = "B_" + lab
-            for i in range(s + 1, e):
-                labels[i] = "I_" + lab
-    return labels
+def collate_batch(batch, pad_token_id: int, label_pad_id: int = -100):
+    input_ids_list = [x["input_ids"] for x in batch]
+    attention_list = [x["attention_mask"] for x in batch]
+    labels_list = [x["labels"] for x in batch]
 
+    max_len = max(len(ids) for ids in input_ids_list)
 
-def align_labels_with_tokens(example: Dict, tokenizer: PreTrainedTokenizerFast) -> Dict:
-    text = example["text"]
-    entities = example.get("entities", [])
-    char_labels = char_labels_from_entities(text, entities)
+    def pad(seq, pad_value, max_len):
+        return seq + [pad_value] * (max_len - len(seq))
 
-    enc = tokenizer(
-        text,
-        return_offsets_mapping=True,
-        truncation=True,
-        max_length=512,
-    )
+    input_ids = [pad(ids, pad_token_id, max_len) for ids in input_ids_list]
+    attention_mask = [pad(am, 0, max_len) for am in attention_list]
+    labels = [pad(lab, label_pad_id, max_len) for lab in labels_list]
 
-    labels = []
-    for idx, (offset_start, offset_end) in enumerate(enc["offset_mapping"]):
-        if offset_start == offset_end:
-            # special token
-            labels.append("O")
-        else:
-            # pick label at first character of token span
-            lab = char_labels[offset_start]
-            labels.append(lab)
-
-    enc_inputs = {
-        "input_ids": enc["input_ids"],
-        "attention_mask": enc["attention_mask"],
-        "labels": [LABELS.index(l) if l in LABELS else 0 for l in labels],
-        "offset_mapping": enc["offset_mapping"],
-        "text": text,
+    out = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "ids": [x["id"] for x in batch],
+        "texts": [x["text"] for x in batch],
+        "offset_mapping": [x["offset_mapping"] for x in batch],
     }
-    return enc_inputs
-
-
-def load_dataset(tokenizer: PreTrainedTokenizerFast, path: str) -> Dataset:
-    raw = read_jsonl(path)
-    mapped = [align_labels_with_tokens(x, tokenizer) for x in raw]
-    return Dataset.from_list(mapped)
+    return out

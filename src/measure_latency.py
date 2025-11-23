@@ -1,59 +1,72 @@
-import argparse
 import json
 import time
-import numpy as np
+import argparse
+import statistics
 
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
 
-def read_jsonl(path: str):
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            data.append(json.loads(line))
-    return data
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_dir", default="out")
+    ap.add_argument("--model_name", default=None)
+    ap.add_argument("--input", default="data/dev.jsonl")
+    ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--runs", type=int, default=50)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = ap.parse_args()
 
-
-def measure(model_dir: str, input_path: str, runs: int = 50, device: str = "cpu"):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-    model = AutoModelForTokenClassification.from_pretrained(model_dir)
-    model.to(device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir if args.model_name is None else args.model_name)
+    model = AutoModelForTokenClassification.from_pretrained(args.model_dir)
+    model.to(args.device)
     model.eval()
 
-    examples = read_jsonl(input_path)
-    times = []
+    texts = []
+    with open(args.input, "r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            texts.append(obj["text"])
+
+    if not texts:
+        print("No texts found in input file.")
+        return
+
+    times_ms = []
+
     # warmup
     for _ in range(5):
-        ex = examples[0]
-        enc = tokenizer(ex["text"], return_tensors="pt", truncation=True, max_length=512)
-        _ = model(**{k: v.to(device) for k, v in enc.items()})
+        t = texts[0]
+        enc = tokenizer(
+            t,
+            truncation=True,
+            max_length=args.max_length,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            _ = model(input_ids=enc["input_ids"].to(args.device), attention_mask=enc["attention_mask"].to(args.device))
 
-    for i in range(runs):
-        ex = examples[i % len(examples)]
-        enc = tokenizer(ex["text"], return_tensors="pt", truncation=True, max_length=512)
+    for i in range(args.runs):
+        t = texts[i % len(texts)]
+        enc = tokenizer(
+            t,
+            truncation=True,
+            max_length=args.max_length,
+            return_tensors="pt",
+        )
         start = time.perf_counter()
         with torch.no_grad():
-            _ = model(**{k: v.to(device) for k, v in enc.items()})
+            _ = model(input_ids=enc["input_ids"].to(args.device), attention_mask=enc["attention_mask"].to(args.device))
         end = time.perf_counter()
-        times.append((end - start) * 1000.0)
+        times_ms.append((end - start) * 1000.0)
 
-    arr = np.array(times)
-    p50 = float(np.percentile(arr, 50))
-    p95 = float(np.percentile(arr, 95))
+    p50 = statistics.median(times_ms)
+    times_sorted = sorted(times_ms)
+    p95 = times_sorted[int(0.95 * len(times_sorted)) - 1]
 
-    print(json.dumps({"p50_ms": p50, "p95_ms": p95, "all_ms": times}, indent=2))
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", required=True)
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--device", default="cpu")
-    args = parser.parse_args()
-
-    measure(args.model_dir, args.input, runs=args.runs, device=args.device)
+    print(f"Latency over {args.runs} runs (batch_size=1):")
+    print(f"  p50: {p50:.2f} ms")
+    print(f"  p95: {p95:.2f} ms")
 
 
 if __name__ == "__main__":

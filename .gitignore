@@ -3,3 +3,10 @@
 src/__pycache__/
 
 out/
+
+out_roberta_crf/
+
+out_run1/
+
+out_synth/
+

@@ -1,94 +1,92 @@
-import argparse
 import os
-from functools import partial
+import argparse
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-import numpy as np
-import evaluate
-import inspect
-from transformers import (
-    AutoTokenizer,
-    DataCollatorForTokenClassification,
-    Trainer,
-    TrainingArguments,
-)
-
-from dataset import load_dataset
+from dataset import PIIDataset, collate_batch
 from labels import LABELS
-from model import build_model
+from model import create_model
+from utils import set_seed, save_training_metadata
+import json
 
 
-def compute_metrics(p, label_list=LABELS):
-    predictions, labels = p
-    preds = np.argmax(predictions, axis=2)
-
-    true_labels = [[label_list[l] for l in seq if l != -100] for seq in labels]
-    true_preds = [[label_list[p_] for (p_, l) in zip(seq_p, seq_l) if l != -100]
-                  for seq_p, seq_l in zip(preds, labels)]
-
-    metric = evaluate.load("seqeval")
-    results = metric.compute(predictions=true_preds, references=true_labels)
-    # return overall f1
-    return {
-        "precision": results["overall_precision"],
-        "recall": results["overall_recall"],
-        "f1": results["overall_f1"],
-    }
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_name", default="distilbert-base-uncased")
+    ap.add_argument("--train", default="data/train.jsonl")
+    ap.add_argument("--dev", default="data/dev.jsonl")
+    ap.add_argument("--out_dir", default="out")
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--use_crf", action="store_true", help="Use CRF decoding head instead of linear classifier")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    return ap.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", default="distilbert-base-uncased")
-    parser.add_argument("--train")
-    parser.add_argument("--dev")
-    parser.add_argument("--out_dir", default="out")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    args = parser.parse_args()
-
+    args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    # Set seeds for reproducibility
+    set_seed(args.seed)
+    # save a copy of args
+    with open(os.path.join(args.out_dir, "train_args.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2)
 
-    train_ds = load_dataset(tokenizer, args.train)
-    dev_ds = load_dataset(tokenizer, args.dev)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    train_ds = PIIDataset(args.train, tokenizer, LABELS, max_length=args.max_length, is_train=True)
+    dev_ds = PIIDataset(args.dev, tokenizer, LABELS, max_length=args.max_length, is_train=False)
 
-    model = build_model(args.model_name, num_labels=len(LABELS))
-
-    data_collator = DataCollatorForTokenClassification(tokenizer)
-
-    ta_init_kwargs = dict(
-        output_dir=args.out_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        learning_rate=args.lr,
-        logging_dir=os.path.join(args.out_dir, "logs"),
-        logging_steps=50,
-        weight_decay=0.01,
-        save_total_limit=2,
-        fp16=False,
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_batch(b, pad_token_id=tokenizer.pad_token_id),
     )
 
-    # Filter kwargs to only those accepted by this Transformers version
-    sig = inspect.signature(TrainingArguments.__init__)
-    valid_kwargs = {k: v for k, v in ta_init_kwargs.items() if k in sig.parameters}
-    training_args = TrainingArguments(**valid_kwargs)
+    model = create_model(args.model_name, use_crf=args.use_crf)
+    model.to(args.device)
+    model.train()
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=dev_ds,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    total_steps = len(train_dl) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps
     )
 
-    trainer.train()
-    trainer.save_model(args.out_dir)
+    for epoch in range(args.epochs):
+        running_loss = 0.0
+        for batch in tqdm(train_dl, desc=f"Epoch {epoch+1}/{args.epochs}"):
+            input_ids = torch.tensor(batch["input_ids"], device=args.device)
+            attention_mask = torch.tensor(batch["attention_mask"], device=args.device)
+            labels = torch.tensor(batch["labels"] , device=args.device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            running_loss += loss.item()
+
+        avg_loss = running_loss / max(1, len(train_dl))
+        print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
+
+    # Save model + tokenizer
+
+    model.save_pretrained(args.out_dir)
+    tokenizer.save_pretrained(args.out_dir)
+    print(f"Saved model + tokenizer to {args.out_dir}")
+
+    # Save metadata
+    save_training_metadata(args.out_dir, {"epochs": args.epochs, "batch_size": args.batch_size, "seed": args.seed, "model_name": args.model_name})
 
 
 if __name__ == "__main__":
