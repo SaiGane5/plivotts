@@ -5,7 +5,7 @@ from typing import List, Dict
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-from src.labels import LABELS, PII_TRUE, entity_label_from_bio
+from labels import LABELS, PII_TRUE, entity_label_from_bio
 
 
 def read_jsonl(path: str) -> List[Dict]:

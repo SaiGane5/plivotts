@@ -4,7 +4,7 @@ from typing import List, Dict
 from datasets import Dataset
 from transformers import PreTrainedTokenizerFast
 
-from src.labels import LABELS
+from labels import LABELS
 
 
 def read_jsonl(path: str) -> List[Dict]:

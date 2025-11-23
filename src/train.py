@@ -3,7 +3,8 @@ import os
 from functools import partial
 
 import numpy as np
-from datasets import load_metric
+import evaluate
+import inspect
 from transformers import (
     AutoTokenizer,
     DataCollatorForTokenClassification,
@@ -11,9 +12,9 @@ from transformers import (
     TrainingArguments,
 )
 
-from src.dataset import load_dataset
-from src.labels import LABELS
-from src.model import build_model
+from dataset import load_dataset
+from labels import LABELS
+from model import build_model
 
 
 def compute_metrics(p, label_list=LABELS):
@@ -24,7 +25,7 @@ def compute_metrics(p, label_list=LABELS):
     true_preds = [[label_list[p_] for (p_, l) in zip(seq_p, seq_l) if l != -100]
                   for seq_p, seq_l in zip(preds, labels)]
 
-    metric = load_metric("seqeval")
+    metric = evaluate.load("seqeval")
     results = metric.compute(predictions=true_preds, references=true_labels)
     # return overall f1
     return {
@@ -56,7 +57,7 @@ def main():
 
     data_collator = DataCollatorForTokenClassification(tokenizer)
 
-    training_args = TrainingArguments(
+    ta_init_kwargs = dict(
         output_dir=args.out_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -70,6 +71,11 @@ def main():
         save_total_limit=2,
         fp16=False,
     )
+
+    # Filter kwargs to only those accepted by this Transformers version
+    sig = inspect.signature(TrainingArguments.__init__)
+    valid_kwargs = {k: v for k, v in ta_init_kwargs.items() if k in sig.parameters}
+    training_args = TrainingArguments(**valid_kwargs)
 
     trainer = Trainer(
         model=model,
